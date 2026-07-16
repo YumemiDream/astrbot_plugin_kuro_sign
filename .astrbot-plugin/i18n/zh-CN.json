@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "Kuro Sign"
+  },
+  "pages": {
+    "admin": {
+      "title": "Kuro Sign 控制台",
+      "desc": "管理定时签到、查看绑定账号并手动触发全量签到。"
+    }
+  }
+}

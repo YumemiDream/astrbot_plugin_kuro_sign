@@ -1,6 +1,5 @@
 import asyncio
 import json
-import secrets
 import threading
 from datetime import datetime
 from http import HTTPStatus
@@ -12,6 +11,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from quart import jsonify, request
 
 from . import kuro_core as core
 
@@ -91,6 +91,16 @@ class OwnerStore:
         with self.lock:
             return list(self.owner_map.items())
 
+    def unbind(self, owner_key: str) -> bool:
+        if not owner_key:
+            return False
+        with self.lock:
+            if owner_key not in self.owner_map:
+                return False
+            self.owner_map.pop(owner_key)
+            self._save_locked()
+            return True
+
 
 class ScheduleStateStore:
     def __init__(self, path: Path, enabled: bool, run_time: str):
@@ -153,38 +163,6 @@ class ScheduleStateStore:
             return dict(self.state)
 
 
-class AdminTokenStore:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.tokens: dict[str, dict[str, Any]] = {}
-
-    def issue(self, owner_key: str, ttl_seconds: int) -> str:
-        token = secrets.token_urlsafe(24)
-        expire_ts = datetime.now().timestamp() + max(60, ttl_seconds)
-        with self.lock:
-            self.tokens[token] = {"owner": owner_key, "expire_ts": expire_ts}
-        return token
-
-    def validate(self, token: str) -> dict[str, Any] | None:
-        if not token:
-            return None
-        now_ts = datetime.now().timestamp()
-        with self.lock:
-            self._cleanup_locked(now_ts)
-            info = self.tokens.get(token)
-            if not info:
-                return None
-            if float(info.get("expire_ts", 0)) <= now_ts:
-                self.tokens.pop(token, None)
-                return None
-            return dict(info)
-
-    def _cleanup_locked(self, now_ts: float) -> None:
-        expired = [key for key, value in self.tokens.items() if float(value.get("expire_ts", 0)) <= now_ts]
-        for key in expired:
-            self.tokens.pop(key, None)
-
-
 class KuroBridge:
     def __init__(
         self,
@@ -192,19 +170,17 @@ class KuroBridge:
         port: int,
         owner_store: OwnerStore,
         schedule_store: ScheduleStateStore,
-        admin_tokens: AdminTokenStore,
-        admin_token_ttl: int,
         public_ip: str = "",
         public_base_url: str = "",
+        use_https: bool = True,
     ):
         self.host = host
         self.port = port
+        self.use_https = use_https
         self.public_ip = public_ip.strip()
         self.public_base_url = public_base_url.strip()
         self.owner_store = owner_store
         self.schedule_store = schedule_store
-        self.admin_tokens = admin_tokens
-        self.admin_token_ttl = max(60, admin_token_ttl)
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -235,19 +211,6 @@ class KuroBridge:
                         if decoded_owner_key and decoded_owner_key != owner_key:
                             bridge.owner_store.bind(decoded_owner_key, sid)
                     self._send_html(core.build_html(), cookie_sid)
-                    return
-
-                if parsed.path == "/admin":
-                    token = (parse_qs(parsed.query).get("token") or [""])[0].strip()
-                    token_info = bridge.admin_tokens.validate(token)
-                    if not token_info:
-                        self._send_json(
-                            HTTPStatus.FORBIDDEN,
-                            {"code": 403, "msg": "invalid or expired admin token"},
-                            cookie_sid,
-                        )
-                        return
-                    self._send_html(core.build_admin_html(token=token), cookie_sid)
                     return
 
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": 404, "msg": "not found"}, cookie_sid)
@@ -317,41 +280,6 @@ class KuroBridge:
                     self._send_json(HTTPStatus.OK, core.run_bbs_sign(session), cookie_sid)
                     return
 
-                if self.path.startswith("/api/admin/"):
-                    token = self.headers.get("X-Admin-Token", "").strip()
-                    admin_info = bridge.admin_tokens.validate(token)
-                    if not admin_info:
-                        self._send_json(HTTPStatus.FORBIDDEN, {"code": 403, "msg": "admin auth failed"}, cookie_sid)
-                        return
-                    if self.path == "/api/admin/status":
-                        self._send_json(HTTPStatus.OK, bridge.admin_status(), cookie_sid)
-                        return
-                    if self.path == "/api/admin/schedule":
-                        run_time = payload.get("time")
-                        enabled = payload.get("enabled")
-                        normalized_time: str | None = None
-                        if run_time is not None:
-                            normalized_time = parse_hhmm(str(run_time))
-                            if not normalized_time:
-                                self._send_json(
-                                    HTTPStatus.BAD_REQUEST,
-                                    {"code": 400, "msg": "time must be HH:MM"},
-                                    cookie_sid,
-                                )
-                                return
-                        state = bridge.schedule_store.update(
-                            enabled=_safe_bool(enabled, False) if enabled is not None else None,
-                            run_time=normalized_time,
-                        )
-                        self._send_json(HTTPStatus.OK, {"code": 200, "msg": "ok", "schedule": state}, cookie_sid)
-                        return
-                    if self.path == "/api/admin/run_all":
-                        result = bridge.sign_all_users(trigger="webui_manual")
-                        self._send_json(HTTPStatus.OK, {"code": 200, "msg": "ok", "result": result}, cookie_sid)
-                        return
-                    self._send_json(HTTPStatus.NOT_FOUND, {"code": 404, "msg": "not found"}, cookie_sid)
-                    return
-
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": 404, "msg": "not found"}, cookie_sid)
 
             def _send_json(self, status: int, data: dict[str, Any], sid: str | None = None) -> None:
@@ -400,27 +328,22 @@ class KuroBridge:
             self._thread = None
 
     def _resolve_public_base(self) -> str:
+        scheme = "https" if self.use_https else "http"
         if self.public_ip:
             ip_or_host = self.public_ip.strip().rstrip("/")
             if ip_or_host.startswith(("http://", "https://")):
                 return ip_or_host
             if ":" in ip_or_host:
-                return f"http://{ip_or_host}"
-            return f"http://{ip_or_host}:{self.port}"
+                return f"{scheme}://{ip_or_host}"
+            return f"{scheme}://{ip_or_host}:{self.port}"
         if self.public_base_url:
             return self.public_base_url.rstrip("/")
-        return f"http://{self.host}:{self.port}"
+        return f"{scheme}://{self.host}:{self.port}"
 
     def login_url(self, owner_key: str) -> str:
         self.ensure_started()
         base = self._resolve_public_base()
         return f"{base}/?user={quote(owner_key, safe='')}"
-
-    def admin_url(self, owner_key: str) -> str:
-        self.ensure_started()
-        base = self._resolve_public_base()
-        token = self.admin_tokens.issue(owner_key=owner_key, ttl_seconds=self.admin_token_ttl)
-        return f"{base}/admin?token={quote(token, safe='')}"
 
     def _get_session(self, owner_key: str) -> tuple[dict[str, str] | None, str]:
         sid = self.owner_store.get(owner_key)
@@ -431,6 +354,16 @@ class KuroBridge:
         if not session:
             return None, "会话不存在，请重新登录"
         return session, ""
+
+    def unbind(self, owner_key: str) -> dict[str, Any]:
+        sid = self.owner_store.get(owner_key)
+        removed = self.owner_store.unbind(owner_key)
+        if sid:
+            with core.SESSIONS_LOCK:
+                core.SESSIONS.pop(sid, None)
+        if not removed:
+            return {"success": False, "msg": "未找到该账号的绑定记录"}
+        return {"success": True, "msg": "已解绑并清除本地会话数据"}
 
     def status(self, owner_key: str) -> dict[str, Any]:
         session, err = self._get_session(owner_key)
@@ -566,7 +499,6 @@ class KuroSignPlugin(Star):
             enabled=_safe_bool(self._cfg("auto_sign_enabled", False), False),
             run_time=self._get_schedule_time(),
         )
-        self.admin_tokens = AdminTokenStore()
 
         host = str(self._cfg("host", "0.0.0.0"))
         public_ip = str(self._cfg("public_ip", "")).strip()
@@ -577,12 +509,17 @@ class KuroSignPlugin(Star):
             port=self._cfg_int("port", 8765),
             owner_store=self.owner_store,
             schedule_store=self.schedule_store,
-            admin_tokens=self.admin_tokens,
-            admin_token_ttl=self._cfg_int("admin_url_ttl_seconds", 900),
             public_ip=public_ip,
             public_base_url=str(self._cfg("public_base_url", "")),
+            use_https=_safe_bool(self._cfg("use_https", True), True),
         )
         self.bridge.set_run_all_callback(self._run_all_sign)
+        self._register_web_apis()
+        self.schedule_notify = _safe_bool(self._cfg("schedule_notify", True), True)
+        try:
+            self._loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self._loop = None
         self._scheduler_stop = threading.Event()
         self._scheduler_thread = threading.Thread(target=self._schedule_loop, daemon=True)
         self._scheduler_thread.start()
@@ -665,6 +602,80 @@ class KuroSignPlugin(Star):
         self.schedule_store.mark_run(payload)
         return payload
 
+    def _register_web_apis(self) -> None:
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/admin/status",
+            self.api_admin_status,
+            ["POST"],
+            "获取 Kuro Sign 管理状态",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/admin/schedule",
+            self.api_admin_schedule,
+            ["POST"],
+            "更新定时签到配置",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/admin/run_all",
+            self.api_admin_run_all,
+            ["POST"],
+            "立即执行全量签到",
+        )
+        self.context.register_web_api(
+            f"/{PLUGIN_NAME}/admin/unbind",
+            self.api_admin_unbind,
+            ["POST"],
+            "解绑/删除账号并清除本地会话数据",
+        )
+
+    async def api_admin_status(self):
+        try:
+            return self.bridge.admin_status()
+        except Exception as e:
+            logger.error(f"kuro api_admin_status error: {e}")
+            return {"code": 500, "msg": str(e)}
+
+    async def api_admin_schedule(self):
+        try:
+            data = await request.get_json(silent=True) or {}
+            enabled = data.get("enabled")
+            run_time = data.get("time")
+            normalized_time: str | None = None
+            if run_time is not None:
+                normalized_time = parse_hhmm(str(run_time))
+                if not normalized_time:
+                    return {"code": 400, "msg": "time must be HH:MM"}, 400
+            state = self.bridge.schedule_store.update(
+                enabled=_safe_bool(enabled, False) if enabled is not None else None,
+                run_time=normalized_time,
+            )
+            return {"code": 200, "msg": "ok", "schedule": state}
+        except Exception as e:
+            logger.error(f"kuro api_admin_schedule error: {e}")
+            return {"code": 500, "msg": str(e)}
+
+    async def api_admin_run_all(self):
+        try:
+            result = self.bridge.sign_all_users(trigger="webui_manual")
+            return {"code": 200, "msg": "ok", "result": result}
+        except Exception as e:
+            logger.error(f"kuro api_admin_run_all error: {e}")
+            return {"code": 500, "msg": str(e)}
+
+    async def api_admin_unbind(self):
+        try:
+            data = await request.get_json(silent=True) or {}
+            target = str(data.get("target") or "").strip()
+            if not target:
+                return {"code": 400, "msg": "target required"}, 400
+            result = self.bridge.unbind(target)
+            if not result.get("success"):
+                return {"code": 404, "msg": result.get("msg", "unbind failed")}, 404
+            return {"code": 200, "msg": "ok", "result": result}
+        except Exception as e:
+            logger.error(f"kuro api_admin_unbind error: {e}")
+            return {"code": 500, "msg": str(e)}
+
     def _schedule_loop(self) -> None:
         while not self._scheduler_stop.wait(15):
             now = datetime.now()
@@ -673,10 +684,49 @@ class KuroSignPlugin(Star):
             try:
                 result = self._run_all_sign("schedule")
                 logger.info(f"kuro scheduled sign done: total={result.get('total')} ok={result.get('ok')}")
+                if self.schedule_notify:
+                    self._notify_schedule(result)
             except Exception as exc:
                 error_payload = {"success": False, "trigger": "schedule", "error": str(exc)}
                 self.schedule_store.mark_run(error_payload)
                 logger.error(f"kuro scheduled sign failed: {exc}")
+
+    def _fmt_schedule_owner(self, item: dict[str, Any]) -> str:
+        user_name = item.get("userName") or item.get("ownerKey") or "-"
+        if not item.get("success") and item.get("msg"):
+            return "\n".join(
+                [
+                    "定时签到结果（schedule）",
+                    f"账号: {user_name}",
+                    f"失败: {item.get('msg')}",
+                ]
+            )
+        waves_map = {"signed": "签到成功", "already_signed": "今日已签到", "failed": "签到失败"}
+        waves_label = waves_map.get(str(item.get("wavesResult", "")), str(item.get("wavesResult", "失败")))
+        bbs_label = "成功" if item.get("bbsSuccess") else "失败"
+        return "\n".join(
+            [
+                "定时签到完成（schedule）",
+                f"账号: {user_name}",
+                f"鸣潮: {waves_label}",
+                f"社区: {bbs_label}",
+            ]
+        )
+
+    def _notify_schedule(self, result: dict[str, Any]) -> None:
+        if not self._loop:
+            logger.warning("kuro schedule notify skipped: event loop unavailable")
+            return
+        items = result.get("results") or []
+        for item in items:
+            owner_key = item.get("ownerKey")
+            if not owner_key:
+                continue
+            text = self._fmt_schedule_owner(item)
+            try:
+                asyncio.run_coroutine_threadsafe(self._send_private_text(owner_key, text), self._loop)
+            except RuntimeError as exc:
+                logger.warning(f"kuro schedule notify failed for {owner_key}: {exc}")
 
     async def _wait_login_success(self, owner_key: str, timeout_sec: int = 180, poll_sec: int = 3) -> dict[str, Any] | None:
         rounds = max(1, timeout_sec // poll_sec)
@@ -746,6 +796,22 @@ class KuroSignPlugin(Star):
             lines.append(f"headUrl: {head_url}")
         yield event.plain_result("\n".join(lines))
 
+    @filter.command("kuro_unbind")
+    async def kuro_unbind(self, event: AstrMessageEvent, target: str = ""):
+        owner_key = self._owner_key(event)
+        if target:
+            if not self._is_admin(event):
+                yield event.plain_result("权限不足：仅管理员可解绑他人，请留空以解绑自己。")
+                return
+            unbind_key = target.strip()
+        else:
+            unbind_key = owner_key
+        result = await asyncio.to_thread(self.bridge.unbind, unbind_key)
+        watch_task = self._login_watch_tasks.pop(unbind_key, None)
+        if watch_task and not watch_task.done():
+            watch_task.cancel()
+        yield event.plain_result(result.get("msg", "已解绑"))
+
     @filter.command("kuro_sign", alias={"ksign", "kuro_checkin"})
     async def kuro_sign(self, event: AstrMessageEvent):
         payload = await asyncio.to_thread(self.bridge.sign_both, self._owner_key(event))
@@ -766,8 +832,10 @@ class KuroSignPlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result("权限不足：仅管理员可用。请在插件配置中设置 admin_ids。")
             return
-        url = await asyncio.to_thread(self.bridge.admin_url, self._owner_key(event))
-        yield event.plain_result(f"Kuro Sign 管理页面：\n{url}\n\n可在此调整定时签到和手动触发全量签到。")
+        yield event.plain_result(
+            "Kuro Sign 管理页面已整合进 AstrBot 控制台（Dashboard）。\n"
+            "请在网页端打开 AstrBot Dashboard -> 插件 -> Kuro Sign，即可调整定时签到与手动触发全量签到。"
+        )
 
     @filter.command("kuro_auto_on")
     async def kuro_auto_on(self, event: AstrMessageEvent, run_time: str = ""):

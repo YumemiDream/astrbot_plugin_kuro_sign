@@ -13,18 +13,18 @@
     "type": "string",
     "description": "只填公网 IP 或域名，插件会自动拼接 URL",
     "default": "",
-    "hint": "示例: 1.2.3.4 或 bot.example.com，返回链接会自动变成 http://公网IP:端口/..."
+    "hint": "示例: 1.2.3.4 或 bot.example.com，返回链接会自动拼接协议"
+  },
+  "use_https": {
+    "type": "bool",
+    "description": "返回的登录/管理链接是否使用 https 协议（公网部署在反代/TLS 后建议开启）",
+    "default": true
   },
   "admin_ids": {
     "type": "list",
     "description": "管理员 ID 列表（sender_id 或 unified_msg_origin）",
     "default": [],
     "hint": "为空时，所有管理员命令和 /kuro_admin 将拒绝访问"
-  },
-  "admin_url_ttl_seconds": {
-    "type": "int",
-    "description": "管理员 WebUI 临时链接有效期（秒）",
-    "default": 900
   },
   "auto_sign_enabled": {
     "type": "bool",
@@ -35,5 +35,10 @@
     "type": "string",
     "description": "定时签到时间，格式 HH:MM（24 小时）",
     "default": "04:05"
+  },
+  "schedule_notify": {
+    "type": "bool",
+    "description": "定时签到完成后，是否把每个账号的结果反馈回其登录所在的群/会话",
+    "default": true
   }
 }
