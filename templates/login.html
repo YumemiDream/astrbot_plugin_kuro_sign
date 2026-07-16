@@ -344,10 +344,11 @@
     }, 300);
     refreshState();
 
+    const pageSid = "%SESSION_ID%";
     function postJson(url, data) {
       return fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Kuro-Session": pageSid },
         body: JSON.stringify(data)
       }).then(async (res) => {
         const payload = await res.json();

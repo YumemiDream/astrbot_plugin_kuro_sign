@@ -30,6 +30,10 @@ ANDROID_USER_AGENT = (
 
 SESSIONS: dict[str, dict[str, str]] = {}
 SESSIONS_LOCK = threading.Lock()
+SESSION_OPERATION_LOCKS: dict[str, threading.Lock] = {}
+SESSION_OPERATION_LOCKS_LOCK = threading.Lock()
+OWNER_OPERATION_LOCKS: dict[str, threading.Lock] = {}
+OWNER_OPERATION_LOCKS_LOCK = threading.Lock()
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -152,8 +156,9 @@ HTML_PAGE = """<!DOCTYPE html>
     phoneInput.addEventListener("input", refreshState);
     codeInput.addEventListener("input", refreshState);
     refreshState();
+    const pageSid = "%SESSION_ID%";
     function postJson(url, data) {
-      return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }).then(async (res) => {
+      return fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-Kuro-Session": pageSid }, body: JSON.stringify(data) }).then(async (res) => {
         const payload = await res.json();
         if (!res.ok) throw payload;
         return payload;
@@ -212,9 +217,14 @@ def _load_template(name: str, fallback: str) -> str:
         return fallback
 
 
-def build_html() -> bytes:
+def build_html(sid: str = "") -> bytes:
     html = _load_template("login.html", HTML_PAGE)
-    return html.replace("%CAPTCHA_ID%", CAPTCHA_ID).replace("%PRODUCT%", PRODUCT).encode("utf-8")
+    return (
+        html.replace("%CAPTCHA_ID%", CAPTCHA_ID)
+        .replace("%PRODUCT%", PRODUCT)
+        .replace("%SESSION_ID%", sid)
+        .encode("utf-8")
+    )
 
 
 
@@ -397,13 +407,40 @@ def run_bbs_sign(session: dict[str, str]) -> dict[str, Any]:
     return {"success": True, "mode": "bbs", "taskResponse": task_res, "actions": actions, "context": {k: context[k] for k in ("roleId", "serverId", "roleName")}}
 
 
+def create_session(owner_key: str = "", notify_umo: str = "") -> str:
+    sid = secrets.token_hex(16)
+    with SESSIONS_LOCK:
+        SESSIONS[sid] = {
+            "h5_devcode": uuid.uuid4().hex,
+            "did": str(uuid.uuid4()).upper(),
+            "owner_key": owner_key,
+            "notify_umo": notify_umo,
+        }
+    return sid
+
+
+def get_session_operation_lock(sid: str) -> threading.Lock:
+    with SESSION_OPERATION_LOCKS_LOCK:
+        lock = SESSION_OPERATION_LOCKS.get(sid)
+        if lock is None:
+            lock = threading.Lock()
+            SESSION_OPERATION_LOCKS[sid] = lock
+        return lock
+
+
+def get_owner_operation_lock(owner_key: str) -> threading.Lock:
+    with OWNER_OPERATION_LOCKS_LOCK:
+        lock = OWNER_OPERATION_LOCKS.get(owner_key)
+        if lock is None:
+            lock = threading.Lock()
+            OWNER_OPERATION_LOCKS[owner_key] = lock
+        return lock
+
+
 def get_or_create_session(handler: BaseHTTPRequestHandler) -> tuple[str, bool]:
     cookie = SimpleCookie(handler.headers.get("Cookie"))
     sid = cookie["sid"].value if "sid" in cookie else ""
-    created = False
     with SESSIONS_LOCK:
-        if sid not in SESSIONS:
-            sid = secrets.token_hex(16)
-            SESSIONS[sid] = {"h5_devcode": uuid.uuid4().hex, "did": str(uuid.uuid4()).upper()}
-            created = True
-    return sid, created
+        if sid in SESSIONS:
+            return sid, False
+    return create_session(), True

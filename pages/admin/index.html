@@ -311,7 +311,9 @@
             renderOwners(data.owners || []);
             setStatus(
               "publicBase: " + (data.publicBase || "-") + "\n" +
-              "schedule: " + (schedule.enabled ? "on" : "off") + " @ " + (schedule.time || "-")
+              "schedule: " + (schedule.enabled ? "on" : "off") + " @ " + (schedule.time || "-") + "\n" +
+              "serverTime: " + (data.serverTime || "-") + "\n" +
+              "scheduler: " + (data.schedulerRunning ? "running" : "stopped")
             );
           } catch (err) {
             setStatus("加载状态失败:\n" + (err && (err.msg || err.message || JSON.stringify(err)) || "unknown"));
